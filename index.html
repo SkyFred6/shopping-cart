@@ -1,0 +1,283 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shopping List</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-beautiful-dnd@13.1.1/dist/react-beautiful-dnd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.22.9/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState } = React;
+    const { DragDropContext, Droppable, Draggable } = window.ReactBeautifulDnd;
+
+    // Calculate days since added
+    const getDaysSinceAdded = (dateAdded) => {
+      const diff = new Date() - new Date(dateAdded);
+      return Math.floor(diff / (1000 * 60 * 60 * 24));
+    };
+
+    // Main App Component
+    const App = () => {
+      const [items, setItems] = useState([]);
+      const [cart, setCart] = useState([]);
+      const [showCheckout, setShowCheckout] = useState(false);
+      const [itemName, setItemName] = useState('');
+      const [itemPrice, setItemPrice] = useState('');
+      const [itemUrl, setItemUrl] = useState('');
+
+      // Add item
+      const addItem = () => {
+        if (itemName && itemPrice > 0) {
+          setItems([...items, {
+            id: `item-${Date.now()}`,
+            name: itemName,
+            price: parseFloat(itemPrice),
+            url: itemUrl || '#',
+            dateAdded: new Date().toISOString(),
+          }]);
+          setItemName('');
+          setItemPrice('');
+          setItemUrl('');
+        }
+      };
+
+      // Handle drag end
+      const onDragEnd = (result) => {
+        const { source, destination } = result;
+        if (!destination) return;
+
+        const draggedItem = items.find(item => item.id === result.draggableId);
+        if (source.droppableId === 'list' && destination.droppableId === 'cart') {
+          setCart([...cart, draggedItem]);
+          setItems(items.filter(item => item.id !== result.draggableId));
+        } else if (source.droppableId === 'list' && destination.droppableId === 'trash') {
+          setItems(items.filter(item => item.id !== result.draggableId));
+        }
+      };
+
+      // Simulate payment
+      const handlePayment = () => {
+        alert('Payment successful!');
+        setCart([]);
+        setShowCheckout(false);
+      };
+
+      return (
+        <DragDropContext onDragEnd={onDragEnd}>
+          <div className="mx-auto p-4 max-w-lg">
+            <h1 className="text-2xl font-bold mb-4 text-center">Shopping List</h1>
+
+            {/* Input Form */}
+            <div className="mb-4 flex flex-col gap-2">
+              <input
+                type="text"
+                placeholder="Item"
+                value={itemName}
+                onChange={(e) => setItemName(e.target.value)}
+                className="border p-2 rounded"
+              />
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  placeholder="Price"
+                  value={itemPrice}
+                  onChange={(e) => setItemPrice(e.target.value)}
+                  className="border p-2 rounded w-24"
+                />
+                <input
+                  type="text"
+                  placeholder="Product URL"
+                  value={itemUrl}
+                  onChange={(e) => setItemUrl(e.target.value)}
+                  className="border p-2 rounded flex-1"
+                />
+              </div>
+              <button
+                onClick={addItem}
+                className="bg-blue-500 text-white p-2 rounded hover:bg-blue-600"
+              >
+                Add
+              </button>
+            </div>
+
+            {/* Shopping List */}
+            <Droppable droppableId="list">
+              {(provided) => (
+                <div
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                  className="bg-gray-100 p-3 rounded min-h-[80px]"
+                >
+                  {items.length === 0 && <p className="text-gray-500">No items.</p>}
+                  {items.map((item, index) => (
+                    <Draggable key={item.id} draggableId={item.id} index={index}>
+                      {(provided) => (
+                        <div
+                          ref={provided.innerRef}
+                          {...provided.draggableProps}
+                          {...provided.dragHandleProps}
+                          className="bg-white p-2 mb-2 rounded shadow"
+                        >
+                          <p>{item.name} - ${item.price.toFixed(2)}</p>
+                          <div className="flex items-center gap-2">
+                            <p className="text-xs text-gray-600">
+                              {getDaysSinceAdded(item.dateAdded)} days ago
+                            </p>
+                            {item.url !== '#' && (
+                              <a
+                                href={item.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-xs text-blue-500 hover:underline"
+                              >
+                                View Product
+                              </a>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </Draggable>
+                  ))}
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+
+            {/* Shopping Cart Button */}
+            <Droppable droppableId="cart">
+              {(provided) => (
+                <div
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                  className="fixed bottom-4 right-4 bg-blue-500 text-white p-3 rounded-full w-12 h-12 flex items-center justify-center cursor-pointer"
+                  onClick={() => cart.length > 0 && setShowCheckout(true)}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+                  </svg>
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+
+            {/* Trash Can */}
+            <Droppable droppableId="trash">
+              {(provided) => (
+                <div
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                  className="fixed bottom-4 left-4 bg-red-500 text-white p-3 rounded-full w-12 h-12 flex items-center justify-center"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5-4h4M9 7v12m6-12v12M10 3h4" />
+                  </svg>
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+
+            {/* Checkout Modal */}
+            {showCheckout && (
+              <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                <div className="bg-white p-4 rounded max-w-sm w-full">
+                  <h2 className="text-xl font-semibold mb-2">Checkout</h2>
+                  {cart.map((item) => (
+                    <div key={item.id} className="flex justify-between">
+                      <span>{item.name}</span>
+                      <span>${item.price.toFixed(2)}</span>
+                    </div>
+                  ))}
+                  <p className="font-bold mt-2">
+                    Total: ${cart.reduce((sum, item) => sum + item.price, 0).toFixed(2)}
+                  </p>
+                  <div className="mt-2">
+                    <input
+                      type="text"
+                      placeholder="Card Number"
+                      className="border p-2 rounded w-full mb-2"
+                    />
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="MM/YY"
+                        className="border p-2 rounded w-1/2"
+                      />
+                      <input
+                        type="text"
+                        placeholder="CVC"
+                        className="border p-2 rounded w-1/2"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex gap-2 mt-2">
+                    <button
+                      onClick={handlePayment}
+                      className="bg-green-500 text-white p-2 rounded flex-1"
+                    >
+                      Pay
+                    </button>
+                    <button
+                      onClick={() => setShowCheckout(false)}
+                      className="bg-gray-500 text-white p-2 rounded flex-1"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </DragDropContext>
+      );
+    };
+
+    // Render the app
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
