@@ -1,0 +1,639 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shopping List</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-beautiful-dnd@13.1.1/dist/react-beautiful-dnd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.22.9/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+    const { DragDropContext, Droppable, Draggable } = window.ReactBeautifulDnd;
+
+    // Static fallback exchange rates (HKD as base)
+    const fallbackExchangeRates = {
+      HKD: 1,
+      USD: 0.128, // 1 HKD = 0.128 USD
+      RMB: 0.916, // 1 HKD = 0.916 RMB
+    };
+
+    const currencySymbols = {
+      HKD: 'HK$',
+      USD: 'US$',
+      RMB: 'CN¥',
+    };
+
+    // Convert price using provided rates
+    const convertPrice = (price, fromCurrency, toCurrency, rates) => {
+      if (fromCurrency === toCurrency) return price;
+      const priceInHKD = fromCurrency === 'HKD' ? price : price / rates[fromCurrency];
+      return toCurrency === 'HKD' ? priceInHKD : priceInHKD * rates[toCurrency];
+    };
+
+    // Calculate days since added
+    const getDaysSinceAdded = (dateAdded) => {
+      const diff = new Date() - new Date(dateAdded);
+      return Math.floor(diff / (1000 * 60 * 60 * 24));
+    };
+
+    // Sort items (excluding top 3)
+    const sortItems = (items, criteria) => {
+      const topThree = items.slice(0, 3);
+      const rest = items.slice(3);
+      
+      const sortedRest = [...rest].sort((a, b) => {
+        switch (criteria) {
+          case 'price-asc':
+            return a.price - b.price;
+          case 'price-desc':
+            return b.price - a.price;
+          case 'name-asc':
+            return a.name.localeCompare(b.name);
+          case 'name-desc':
+            return b.name.localeCompare(a.name);
+          case 'date-asc':
+            return new Date(a.dateAdded) - new Date(b.dateAdded);
+          case 'date-desc':
+            return new Date(b.dateAdded) - new Date(a.dateAdded);
+          default:
+            return 0;
+        }
+      });
+
+      return [...topThree, ...sortedRest];
+    };
+
+    // Main App Component
+    const App = () => {
+      // Initialize state from localStorage or defaults
+      const [items, setItems] = useState(() => {
+        const savedItems = localStorage.getItem('shoppingItems');
+        return savedItems
+          ? JSON.parse(savedItems).map(item => ({
+              ...item,
+              originalCurrency: item.originalCurrency || 'HKD',
+            }))
+          : [];
+      });
+      const [cart, setCart] = useState(() => {
+        const savedCart = localStorage.getItem('shoppingCart');
+        return savedCart
+          ? JSON.parse(savedCart).map(item => ({
+              ...item,
+              originalCurrency: item.originalCurrency || 'HKD',
+            }))
+          : [];
+      });
+      const [displayCurrency, setDisplayCurrency] = useState(() => {
+        return localStorage.getItem('displayCurrency') || 'HKD';
+      });
+      const [sortCriteria, setSortCriteria] = useState(() => {
+        return localStorage.getItem('sortCriteria') || 'none';
+      });
+      const [exchangeRates, setExchangeRates] = useState(fallbackExchangeRates);
+      const [apiStatus, setApiStatus] = useState('loading');
+      const [statusMessage, setStatusMessage] = useState(null);
+      const [showCheckout, setShowCheckout] = useState(false);
+      const [showReceipt, setShowReceipt] = useState(false);
+      const [showEditModal, setShowEditModal] = useState(false);
+      const [editingItem, setEditingItem] = useState(null);
+      const [itemName, setItemName] = useState('');
+      const [itemPrice, setItemPrice] = useState('');
+      const [itemUrl, setItemUrl] = useState('');
+      const [inputCurrency, setInputCurrency] = useState('HKD');
+
+      // Fetch exchange rates with timeout
+      useEffect(() => {
+        const fetchRates = async () => {
+          const cachedRates = localStorage.getItem('exchangeRates');
+          const cachedTimestamp = localStorage.getItem('exchangeRatesTimestamp');
+          const now = Date.now();
+          const oneDay = 24 * 60 * 60 * 1000;
+
+          if (cachedRates && cachedTimestamp && now - cachedTimestamp < oneDay) {
+            setExchangeRates(JSON.parse(cachedRates));
+            setApiStatus('success');
+            setStatusMessage(null);
+            return;
+          }
+
+          const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Timeout')), 5000);
+          });
+
+          try {
+            const response = await Promise.race([
+              fetch('https://open.exchangerate-api.com/v6/latest?base=HKD'),
+              timeoutPromise
+            ]);
+            const data = await response.json();
+            if (data.result === 'success') {
+              const newRates = {
+                HKD: 1,
+                USD: data.rates.USD,
+                RMB: data.rates.CNY,
+              };
+              setExchangeRates(newRates);
+              localStorage.setItem('exchangeRates', JSON.stringify(newRates));
+              localStorage.setItem('exchangeRatesTimestamp', now.toString());
+              setApiStatus('success');
+              setStatusMessage(null);
+            } else {
+              throw new Error('API error');
+            }
+          } catch (error) {
+            setExchangeRates(fallbackExchangeRates);
+            setApiStatus('error');
+            setStatusMessage('Using fallback rates');
+            setTimeout(() => setStatusMessage(null), 3000); // Hide message after 3 seconds
+          }
+        };
+
+        setStatusMessage('Loading rates...');
+        fetchRates();
+      }, []);
+
+      // Save state to localStorage
+      useEffect(() => {
+        localStorage.setItem('shoppingItems', JSON.stringify(items));
+      }, [items]);
+
+      useEffect(() => {
+        localStorage.setItem('shoppingCart', JSON.stringify(cart));
+      }, [cart]);
+
+      useEffect(() => {
+        localStorage.setItem('displayCurrency', displayCurrency);
+      }, [displayCurrency]);
+
+      useEffect(() => {
+        localStorage.setItem('sortCriteria', sortCriteria);
+        if (sortCriteria !== 'none') {
+          setItems(sortItems(items, sortCriteria));
+        }
+      }, [sortCriteria]);
+
+      // Add item
+      const addItem = () => {
+        if (itemName && itemPrice > 0) {
+          const priceInHKD = convertPrice(parseFloat(itemPrice), inputCurrency, 'HKD', exchangeRates);
+          const newItems = [...items, {
+            id: `item-${Date.now()}`,
+            name: itemName,
+            price: priceInHKD,
+            url: itemUrl || '#',
+            dateAdded: new Date().toISOString(),
+            originalCurrency: inputCurrency,
+          }];
+          setItems(sortCriteria !== 'none' ? sortItems(newItems, sortCriteria) : newItems);
+          setItemName('');
+          setItemPrice('');
+          setItemUrl('');
+          setInputCurrency('HKD');
+        }
+      };
+
+      // Edit item
+      const startEditing = (item) => {
+        setEditingItem(item);
+        setItemName(item.name);
+        setItemPrice(convertPrice(item.price, 'HKD', item.originalCurrency, exchangeRates).toFixed(2));
+        setItemUrl(item.url === '#' ? '' : item.url);
+        setInputCurrency(item.originalCurrency);
+        setShowEditModal(true);
+      };
+
+      const saveEdit = () => {
+        if (itemName && itemPrice > 0) {
+          const priceInHKD = convertPrice(parseFloat(itemPrice), inputCurrency, 'HKD', exchangeRates);
+          const updatedItems = items.map(item =>
+            item.id === editingItem.id
+              ? {
+                  ...item,
+                  name: itemName,
+                  price: priceInHKD,
+                  url: itemUrl || '#',
+                  originalCurrency: inputCurrency,
+                }
+              : item
+          );
+          setItems(sortCriteria !== 'none' ? sortItems(updatedItems, sortCriteria) : updatedItems);
+          setShowEditModal(false);
+          setItemName('');
+          setItemPrice('');
+          setItemUrl('');
+          setInputCurrency('HKD');
+          setEditingItem(null);
+        }
+      };
+
+      // Handle drag end (reorder, cart, trash)
+      const onDragEnd = (result) => {
+        const { source, destination } = result;
+        if (!destination) return;
+
+        if (source.droppableId === 'list' && destination.droppableId === 'list') {
+          // Reorder within shopping list
+          const reorderedItems = [...items];
+          const [movedItem] = reorderedItems.splice(source.index, 1);
+          reorderedItems.splice(destination.index, 0, movedItem);
+          setItems(reorderedItems);
+        } else if (source.droppableId === 'list' && destination.droppableId === 'cart') {
+          // Move to cart
+          const draggedItem = items.find(item => item.id === result.draggableId);
+          setCart([...cart, draggedItem]);
+          const newItems = items.filter(item => item.id !== result.draggableId);
+          setItems(sortCriteria !== 'none' ? sortItems(newItems, sortCriteria) : newItems);
+        } else if (source.droppableId === 'list' && destination.droppableId === 'trash') {
+          // Move to trash
+          const newItems = items.filter(item => item.id !== result.draggableId);
+          setItems(sortCriteria !== 'none' ? sortItems(newItems, sortCriteria) : newItems);
+        }
+      };
+
+      // Simulate payment
+      const handlePayment = () => {
+        setShowCheckout(false);
+        setShowReceipt(true);
+        setCart([]);
+      };
+
+      return (
+        <DragDropContext onDragEnd={onDragEnd}>
+          <div className="mx-auto p-4 max-w-lg">
+            <h1 className="text-xl text-gray-800 mb-4 text-center">Shopping List</h1>
+
+            {/* API Status Message */}
+            {statusMessage && (
+              <p className="text-center text-base text-gray-500 mb-2">{statusMessage}</p>
+            )}
+
+            {/* Display Currency Selector */}
+            <div className="mb-4 flex justify-center">
+              <select
+                value={displayCurrency}
+                onChange={(e) => setDisplayCurrency(e.target.value)}
+                className="border border-gray-200 p-2 rounded text-base text-gray-600"
+              >
+                <option value="HKD">HKD</option>
+                <option value="USD">USD</option>
+                <option value="RMB">RMB</option>
+              </select>
+            </div>
+
+            {/* Input Form */}
+            <div className="mb-4 flex flex-wrap gap-3">
+              <input
+                type="text"
+                placeholder="Item Name"
+                value={itemName}
+                onChange={(e) => setItemName(e.target.value)}
+                className="border border-gray-200 p-2 rounded text-base flex-1 min-w-[150px]"
+              />
+              <input
+                type="number"
+                placeholder="Price"
+                value={itemPrice}
+                onChange={(e) => setItemPrice(e.target.value)}
+                className="border border-gray-200 p-2 rounded text-base w-24"
+              />
+              <select
+                value={inputCurrency}
+                onChange={(e) => setInputCurrency(e.target.value)}
+                className="border border-gray-200 p-2 rounded text-base w-24"
+              >
+                <option value="HKD">HKD</option>
+                <option value="USD">USD</option>
+                <option value="RMB">RMB</option>
+              </select>
+              <input
+                type="text"
+                placeholder="Product Link"
+                value={itemUrl}
+                onChange={(e) => setItemUrl(e.target.value)}
+                className="border border-gray-200 p-2 rounded text-base flex-1 min-w-[150px]"
+              />
+              <button
+                onClick={addItem}
+                className="bg-blue-500 text-white p-2 rounded text-base hover:bg-blue-600 w-full sm:w-auto"
+              >
+                Add
+              </button>
+            </div>
+
+            {/* Sort Selector */}
+            <div className="mb-3 flex items-center justify-between text-base text-gray-600">
+              <span>Sort below top 3:</span>
+              <select
+                value={sortCriteria}
+                onChange={(e) => setSortCriteria(e.target.value)}
+                className="border border-gray-200 p-2 rounded text-base"
+              >
+                <option value="none">No Sort</option>
+                <option value="price-asc">Price: Low to High</option>
+                <option value="price-desc">Price: High to Low</option>
+                <option value="name-asc">Name: A-Z</option>
+                <option value="name-desc">Name: Z-A</option>
+                <option value="date-asc">Added: Oldest</option>
+                <option value="date-desc">Added: Newest</option>
+              </select>
+            </div>
+
+            {/* Shopping List */}
+            <Droppable droppableId="list">
+              {(provided) => (
+                <div
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                  className="bg-gray-50 p-3 rounded min-h-[80px]"
+                >
+                  {items.length === 0 && <p className="text-gray-400 text-base text-center">No items</p>}
+                  {items.map((item, index) => (
+                    <Draggable key={item.id} draggableId={item.id} index={index}>
+                      {(provided) => (
+                        <div
+                          ref={provided.innerRef}
+                          {...provided.draggableProps}
+                          {...provided.dragHandleProps}
+                          className="bg-white p-3 mb-2 rounded flex justify-between items-center"
+                        >
+                          <div>
+                            <p className="flex items-center text-base text-gray-800">
+                              {index < 3 && (
+                                <svg className="w-5 h-5 text-yellow-400 mr-2" fill="currentColor" viewBox="0 0 20 20">
+                                  <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
+                                </svg>
+                              )}
+                              {item.name} - {currencySymbols[displayCurrency]}
+                              {convertPrice(item.price, 'HKD', displayCurrency, exchangeRates).toFixed(2)}
+                            </p>
+                            <div className="flex items-center gap-3 text-sm text-gray-500">
+                              <span>{getDaysSinceAdded(item.dateAdded)} days ago</span>
+                              {item.url !== '#' && (
+                                <a
+                                  href={item.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-blue-500 hover:underline"
+                                >
+                                  Link
+                                </a>
+                              )}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => startEditing(item)}
+                            className="text-blue-500 hover:text-blue-600"
+                          >
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15.828l-5.657 1.414 1.414-5.657L18.414 2.586z" />
+                            </svg>
+                          </button>
+                        </div>
+                      )}
+                    </Draggable>
+                  ))}
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+
+            {/* Shopping Cart Button */}
+            <Droppable droppableId="cart">
+              {(provided) => (
+                <div
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                  className="fixed bottom-4 right-4 bg-blue-500 text-white p-3 rounded-full w-12 h-12 flex items-center justify-center cursor-pointer"
+                  onClick={() => cart.length > 0 && setShowCheckout(true)}
+                >
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+                  </svg>
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+
+            {/* Trash Can */}
+            <Droppable droppableId="trash">
+              {(provided) => (
+                <div
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                  className="fixed bottom-4 left-4 bg-red-500 text-white p-3 rounded-full w-12 h-12 flex items-center justify-center"
+                >
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5-4h4M9 7v12m6-12v12M10 3h4" />
+                  </svg>
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+
+            {/* Edit Modal */}
+            {showEditModal && (
+              <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center">
+                <div className="bg-white p-4 rounded max-w-md w-full">
+                  <h2 className="text-lg text-gray-800 mb-3">Edit Item</h2>
+                  <input
+                    type="text"
+                    placeholder="Item Name"
+                    value={itemName}
+                    onChange={(e) => setItemName(e.target.value)}
+                    className="border border-gray-200 p-2 rounded w-full mb-3 text-base"
+                  />
+                  <div className="flex gap-3 mb-3">
+                    <input
+                      type="number"
+                      placeholder="Price"
+                      value={itemPrice}
+                      onChange={(e) => setItemPrice(e.target.value)}
+                      className="border border-gray-200 p-2 rounded w-28 text-base"
+                    />
+                    <select
+                      value={inputCurrency}
+                      onChange={(e) => setInputCurrency(e.target.value)}
+                      className="border border-gray-200 p-2 rounded w-28 text-base"
+                    >
+                      <option value="HKD">HKD</option>
+                      <option value="USD">USD</option>
+                      <option value="RMB">RMB</option>
+                    </select>
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="Product Link"
+                    value={itemUrl}
+                    onChange={(e) => setItemUrl(e.target.value)}
+                    className="border border-gray-200 p-2 rounded w-full mb-3 text-base"
+                  />
+                  <div className="flex gap-3">
+                    <button
+                      onClick={saveEdit}
+                      className="bg-green-500 text-white p-2 rounded text-base flex-1"
+                    >
+                      Save
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowEditModal(false);
+                        setItemName('');
+                        setItemPrice('');
+                        setItemUrl('');
+                        setInputCurrency('HKD');
+                        setEditingItem(null);
+                      }}
+                      className="bg-gray-400 text-white p-2 rounded text-base flex-1"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Checkout Modal */}
+            {showCheckout && (
+              <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center">
+                <div className="bg-white p-4 rounded max-w-md w-full">
+                  <h2 className="text-lg text-gray-800 mb-3">Checkout</h2>
+                  {cart.map((item) => (
+                    <div key={item.id} className="flex justify-between text-base text-gray-600 mb-2">
+                      <span>{item.name}</span>
+                      <span>
+                        {currencySymbols[displayCurrency]}
+                        {convertPrice(item.price, 'HKD', displayCurrency, exchangeRates).toFixed(2)}
+                      </span>
+                    </div>
+                  ))}
+                  <p className="text-base text-gray-800 mt-2">
+                    Total: {currencySymbols[displayCurrency]}
+                    {cart
+                      .reduce((sum, item) => sum + convertPrice(item.price, 'HKD', displayCurrency, exchangeRates), 0)
+                      .toFixed(2)}
+                  </p>
+                  <div className="mt-3">
+                    <input
+                      type="text"
+                      placeholder="Card Number"
+                      className="border border-gray-200 p-2 rounded w-full mb-3 text-base"
+                    />
+                    <div className="flex gap-3">
+                      <input
+                        type="text"
+                        placeholder="MM/YY"
+                        className="border border-gray-200 p-2 rounded w-1/2 text-base"
+                      />
+                      <input
+                        type="text"
+                        placeholder="CVC"
+                        className="border border-gray-200 p-2 rounded w-1/2 text-base"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex gap-3 mt-3">
+                    <button
+                      onClick={handlePayment}
+                      className="bg-green-500 text-white p-2 rounded text-base flex-1"
+                    >
+                      Pay
+                    </button>
+                    <button
+                      onClick={() => setShowCheckout(false)}
+                      className="bg-gray-400 text-white p-2 rounded text-base flex-1"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Receipt Modal */}
+            {showReceipt && (
+              <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center">
+                <div className="bg-white p-4 rounded max-w-md w-full">
+                  <h2 className="text-lg text-gray-800 mb-3">Receipt</h2>
+                  <p className="text-sm text-gray-500 mb-3">
+                    Paid: {new Date().toLocaleString()}
+                  </p>
+                  {cart.map((item) => (
+                    <div key={item.id} className="flex justify-between text-base text-gray-600 mb-2">
+                      <span>{item.name}</span>
+                      <span>
+                        {currencySymbols[displayCurrency]}
+                        {convertPrice(item.price, 'HKD', displayCurrency, exchangeRates).toFixed(2)}
+                      </span>
+                    </div>
+                  ))}
+                  <p className="text-base text-gray-800 mt-2">
+                    Total: {currencySymbols[displayCurrency]}
+                    {cart
+                      .reduce((sum, item) => sum + convertPrice(item.price, 'HKD', displayCurrency, exchangeRates), 0)
+                      .toFixed(2)}
+                  </p>
+                  <button
+                    onClick={() => setShowReceipt(false)}
+                    className="bg-blue-500 text-white p-2 rounded text-base mt-3 w-full"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </DragDropContext>
+      );
+    };
+
+    // Render the app
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
